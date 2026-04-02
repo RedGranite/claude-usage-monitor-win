@@ -103,6 +103,24 @@ def _try_rookiepy_elevated() -> dict:
     The elevated process extracts cookies and writes them to a temp file.
     """
     import ctypes
+    import tkinter as tk
+    from tkinter import messagebox
+
+    # Ask user before triggering UAC
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    answer = messagebox.askyesno(
+        "Claude Usage Monitor",
+        "Need admin permission to read browser cookies\n"
+        "(Edge/Chrome v130+ encrypts cookies).\n\n"
+        "Click Yes, then approve the Windows UAC prompt.",
+        parent=root,
+    )
+    root.destroy()
+    if not answer:
+        log.info("User declined admin elevation")
+        return {}
 
     # Temp file for results
     tmp = os.path.join(tempfile.gettempdir(), "claude_cookies.json")

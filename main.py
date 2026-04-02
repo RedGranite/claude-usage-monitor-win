@@ -719,11 +719,27 @@ class UsageMonitor:
 if __name__ == "__main__":
     # Special mode: extract cookies and exit (used by UAC elevation)
     if len(sys.argv) >= 3 and sys.argv[1] == "--extract-cookies":
-        from cookie_helper import extract_cookies
         import json as _json
-        result = extract_cookies()
+        _result = {}
+        try:
+            import rookiepy
+            for _name, _fn in [("Edge", rookiepy.edge), ("Chrome", rookiepy.chrome), ("Firefox", rookiepy.firefox)]:
+                try:
+                    _raw = _fn(["claude.ai"])
+                    _cookies = {}
+                    for _c in _raw:
+                        if "claude.ai" in _c.get("domain", ""):
+                            _cookies[_c["name"]] = _c["value"]
+                    if _cookies and "sessionKey" in _cookies:
+                        _cookies["_browser"] = _name
+                        _result = _cookies
+                        break
+                except Exception:
+                    continue
+        except Exception as _e:
+            _result = {"error": str(_e)}
         with open(sys.argv[2], "w", encoding="utf-8") as _f:
-            _json.dump(result, _f)
+            _json.dump(_result, _f)
         sys.exit(0)
 
     if not check_single_instance():
