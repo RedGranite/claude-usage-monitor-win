@@ -20,7 +20,7 @@ import logging
 import threading
 import time
 import tkinter as tk
-from tkinter import simpledialog, messagebox
+from tkinter import messagebox
 from datetime import datetime, timezone
 import sys
 import ctypes
@@ -28,7 +28,8 @@ import ctypes
 from PIL import Image, ImageDraw, ImageFont
 import pystray
 
-from claude_api import ClaudeAPI, ClaudeAPIError, extract_browser_cookies
+from claude_api import ClaudeAPI, ClaudeAPIError
+from webview_login import login_and_get_cookies
 from config import load_config, save_config, CONFIG_DIR
 
 from typing import Optional
@@ -190,15 +191,14 @@ class UsageMonitor:
         self._strip_on = True                    # Blink state for tray icon light strip
         self._popup_open = False                 # Prevents multiple dashboard windows
         self._popup_pinned = False               # Dashboard "always on top" state
+        self._data_version = 0                   # Incremented on each successful refresh
 
-        self._browser_cookies = {}
+        self._cookies = {}  # Browser cookies for API requests
         if self.config.get("session_key"):
-            # Restore cookies from config (including cf_clearance if saved)
-            cookies = {"sessionKey": self.config["session_key"]}
+            self._cookies = {"sessionKey": self.config["session_key"]}
             if self.config.get("cf_clearance"):
-                cookies["cf_clearance"] = self.config["cf_clearance"]
-            self._browser_cookies = cookies
-            self.api = ClaudeAPI(self.config["session_key"], browser_cookies=cookies)
+                self._cookies["cf_clearance"] = self.config["cf_clearance"]
+            self.api = ClaudeAPI(self._cookies)
 
     # -----------------------------------------------------------------------
     # Tray icon rendering
@@ -313,7 +313,7 @@ class UsageMonitor:
         items.append(pystray.MenuItem("Show Dashboard", self._on_show_popup, default=True))
         items.append(pystray.Menu.SEPARATOR)
         items.append(pystray.MenuItem("Refresh Now", self._on_refresh))
-        items.append(pystray.MenuItem("Set Session Key...", self._on_set_key))
+        items.append(pystray.MenuItem("Re-login...", self._on_set_key))
         items.append(pystray.Menu.SEPARATOR)
         items.append(pystray.MenuItem(f"v{APP_VERSION}", None, enabled=False))
         items.append(pystray.MenuItem("Quit", self._on_quit))
@@ -335,14 +335,19 @@ class UsageMonitor:
           - Color-coded progress bars for each usage period
           - Pin button to keep window always-on-top
           - Only one instance allowed at a time (_popup_open flag)
+          - Live-updating: content refreshes automatically when new data arrives
+          - Flash animation on each data refresh
         """
         if self._popup_open:
             return
         self._popup_open = True
 
+        BG = "#1E1E1E"
+        FLASH_BG = "#1A2E1A"  # Subtle green tint for refresh flash
+
         popup = tk.Tk()
         popup.title("Claude Usage")
-        popup.configure(bg="#1E1E1E")
+        popup.configure(bg=BG)
         popup.overrideredirect(True)  # Remove native title bar
         popup.attributes("-topmost", self._popup_pinned)
 
@@ -352,10 +357,10 @@ class UsageMonitor:
         popup.geometry(f"{w}x{h}+{sw - w - 20}+{sh - h - 60}")
 
         # --- Custom title bar ---
-        title_row = tk.Frame(popup, bg="#1E1E1E")
+        title_row = tk.Frame(popup, bg=BG)
         title_row.pack(fill="x", padx=10, pady=(8, 0))
         tk.Label(title_row, text="Claude Usage", font=("Segoe UI", 11, "bold"),
-                 fg="#FFFFFF", bg="#1E1E1E").pack(side="left")
+                 fg="#FFFFFF", bg=BG).pack(side="left")
 
         def on_close():
             self._popup_open = False
@@ -363,7 +368,7 @@ class UsageMonitor:
 
         # Close button (red ✕)
         tk.Button(title_row, text="\u2715", command=on_close,
-                  bg="#1E1E1E", fg="#F44336", font=("Segoe UI", 10, "bold"),
+                  bg=BG, fg="#F44336", font=("Segoe UI", 10, "bold"),
                   relief="flat", bd=0, padx=4, pady=0,
                   activebackground="#F44336", activeforeground="#FFFFFF").pack(side="right")
 
@@ -372,13 +377,13 @@ class UsageMonitor:
             self._popup_pinned = not self._popup_pinned
             popup.attributes("-topmost", self._popup_pinned)
             pin_btn.config(
-                bg="#4CAF50" if self._popup_pinned else "#1E1E1E",
+                bg="#4CAF50" if self._popup_pinned else BG,
                 fg="#FFFFFF" if self._popup_pinned else "#888888",
             )
 
         pin_btn = tk.Button(
             title_row, text="\U0001f4cc", command=toggle_pin,
-            bg="#4CAF50" if self._popup_pinned else "#1E1E1E",
+            bg="#4CAF50" if self._popup_pinned else BG,
             fg="#FFFFFF" if self._popup_pinned else "#888888",
             font=("Segoe UI", 9), relief="flat", bd=0, padx=4, pady=0,
             activebackground="#4CAF50", activeforeground="#FFFFFF",
@@ -400,77 +405,144 @@ class UsageMonitor:
         title_row.bind("<Button-1>", start_drag)
         title_row.bind("<B1-Motion>", do_drag)
 
-        # --- Content area ---
+        # --- Separator ---
         tk.Frame(popup, bg="#333333", height=1).pack(fill="x", padx=10, pady=(6, 0))
 
-        if self.config.get("org_name"):
-            tk.Label(popup, text=f"Org: {self.config['org_name']}", font=("Segoe UI", 9),
-                     fg="#888888", bg="#1E1E1E").pack(anchor="w", padx=15, pady=(4, 0))
+        # --- Dynamic content area (rebuilt on each data refresh) ---
+        content = tk.Frame(popup, bg=BG)
+        content.pack(fill="both", expand=True)
 
-        if self.usage:
-            frame = tk.Frame(popup, bg="#1E1E1E")
-            frame.pack(padx=15, pady=6, fill="x")
+        _WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
-            # Weekday names for 7d reset display
-            _WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        def build_content(bg_color=BG):
+            """Clear and rebuild all dynamic content with current data."""
+            for child in content.winfo_children():
+                child.destroy()
+            content.configure(bg=bg_color)
 
-            for key in ("five_hour", "seven_day"):
-                data = self.usage.get(key)
-                if not data:
-                    continue
-                label = data["label"]
-                pct = data["percentage"]
-                reset = data.get("reset_time")
-                color = self._pct_color(pct)
-                color_dim = self._pct_color_dim(pct)
+            if self.config.get("org_name"):
+                tk.Label(content, text=f"Org: {self.config['org_name']}",
+                         font=("Segoe UI", 9), fg="#888888",
+                         bg=bg_color).pack(anchor="w", padx=15, pady=(4, 0))
 
-                # Format reset time based on period type
-                reset_str = ""
-                if reset:
-                    now = datetime.now(timezone.utc)
-                    delta = reset - now
-                    if delta.total_seconds() > 0:
-                        if key == "seven_day":
-                            # 7d: show weekday + local time, e.g. "resets Wed 22:00"
-                            local_reset = reset.astimezone()
-                            day = _WEEKDAYS[local_reset.weekday()]
-                            reset_str = f"resets {day} {local_reset.strftime('%H:%M')}"
-                        else:
-                            # 5h: show countdown, e.g. "resets in 2h11m"
-                            hours = int(delta.total_seconds() // 3600)
-                            minutes = int((delta.total_seconds() % 3600) // 60)
-                            reset_str = f"resets in {hours}h{minutes}m"
+            if self.usage:
+                frame = tk.Frame(content, bg=bg_color)
+                frame.pack(padx=15, pady=6, fill="x")
 
-                # Label + percentage row
-                row = tk.Frame(frame, bg="#1E1E1E")
-                row.pack(fill="x", pady=(8, 2))
-                tk.Label(row, text=label, font=("Segoe UI", 10),
-                         fg="#CCCCCC", bg="#1E1E1E").pack(side="left")
-                tk.Label(row, text=f"{pct:.0f}%", font=("Segoe UI", 10, "bold"),
-                         fg=color, bg="#1E1E1E").pack(side="right")
+                for key in ("five_hour", "seven_day"):
+                    data = self.usage.get(key)
+                    if not data:
+                        continue
+                    label = data["label"]
+                    pct = data["percentage"]
+                    reset = data.get("reset_time")
+                    color = self._pct_color(pct)
+                    color_dim = self._pct_color_dim(pct)
 
-                # Color-coded progress bar (fixed 280px width)
-                bar_h = 12
-                bar_w = 280
-                canvas = tk.Canvas(frame, width=bar_w, height=bar_h, bg="#2A2A2A",
-                                   highlightthickness=0, bd=0)
-                canvas.pack(anchor="w")
-                filled_w = max(1, int(pct / 100 * bar_w)) if pct > 0 else 0
-                if filled_w > 0:
-                    canvas.create_rectangle(0, 0, filled_w, bar_h, fill=color, outline="")
-                canvas.create_rectangle(filled_w, 0, bar_w, bar_h, fill=color_dim, outline="")
+                    # Format reset time
+                    reset_str = ""
+                    if reset:
+                        now = datetime.now(timezone.utc)
+                        delta = reset - now
+                        if delta.total_seconds() > 0:
+                            if key == "seven_day":
+                                local_reset = reset.astimezone()
+                                day = _WEEKDAYS[local_reset.weekday()]
+                                reset_str = f"resets {day} {local_reset.strftime('%H:%M')}"
+                            else:
+                                hours = int(delta.total_seconds() // 3600)
+                                minutes = int((delta.total_seconds() % 3600) // 60)
+                                reset_str = f"resets in {hours}h{minutes}m"
 
-                # Reset time label (larger font)
-                if reset_str:
-                    tk.Label(frame, text=reset_str, font=("Segoe UI", 11),
-                             fg="#AAAAAA", bg="#1E1E1E").pack(anchor="e", pady=(4, 0))
+                    # Label + percentage row
+                    row = tk.Frame(frame, bg=bg_color)
+                    row.pack(fill="x", pady=(8, 2))
+                    tk.Label(row, text=label, font=("Segoe UI", 10),
+                             fg="#CCCCCC", bg=bg_color).pack(side="left")
+                    tk.Label(row, text=f"{pct:.0f}%", font=("Segoe UI", 10, "bold"),
+                             fg=color, bg=bg_color).pack(side="right")
 
-        elif self.last_error:
-            tk.Label(popup, text=f"Error: {self.last_error}", font=("Segoe UI", 9),
-                     fg="#F44336", bg="#1E1E1E", wraplength=280).pack(pady=10)
-        else:
-            tk.Label(popup, text="No data yet...", font=("Segoe UI", 10),
-                     fg="#888888", bg="#1E1E1E").pack(pady=20)
+                    # Progress bar
+                    bar_h = 12
+                    bar_w = 280
+                    canvas = tk.Canvas(frame, width=bar_w, height=bar_h,
+                                       bg="#2A2A2A", highlightthickness=0, bd=0)
+                    canvas.pack(anchor="w")
+                    filled_w = max(1, int(pct / 100 * bar_w)) if pct > 0 else 0
+                    if filled_w > 0:
+                        canvas.create_rectangle(0, 0, filled_w, bar_h,
+                                                fill=color, outline="")
+                    canvas.create_rectangle(filled_w, 0, bar_w, bar_h,
+                                            fill=color_dim, outline="")
+
+                    # Reset time label
+                    if reset_str:
+                        tk.Label(frame, text=reset_str, font=("Segoe UI", 11),
+                                 fg="#AAAAAA", bg=bg_color).pack(anchor="e", pady=(4, 0))
+
+            elif self.last_error:
+                tk.Label(content, text=f"Error: {self.last_error}",
+                         font=("Segoe UI", 9), fg="#F44336", bg=bg_color,
+                         wraplength=280).pack(pady=10)
+            else:
+                tk.Label(content, text="No data yet...",
+                         font=("Segoe UI", 10), fg="#888888",
+                         bg=bg_color).pack(pady=20)
+
+        # --- Flash animation on data refresh ---
+        _flash = {"active": False}
+
+        def do_flash():
+            """Play a 3-step flash animation when data refreshes.
+
+            Step 1: Green-tinted background + bright green top accent line
+            Step 2: Accent line brightens
+            Step 3: Restore normal dark background
+            """
+            if _flash["active"]:
+                return
+            _flash["active"] = True
+
+            # Step 1: rebuild with green-tinted background + accent line
+            build_content(bg_color=FLASH_BG)
+            accent = tk.Frame(content, bg="#4CAF50", height=2)
+            accent.pack(side="top", fill="x", before=content.winfo_children()[0])
+
+            def step2():
+                try:
+                    accent.configure(height=3, bg="#66BB6A")
+                except tk.TclError:
+                    _flash["active"] = False
+                    return
+                popup.after(150, step3)
+
+            def step3():
+                try:
+                    accent.destroy()
+                    build_content(bg_color=BG)
+                except tk.TclError:
+                    pass
+                _flash["active"] = False
+
+            popup.after(200, step2)
+
+        # --- Periodic check for data updates (every 1 second) ---
+        last_ver = [self._data_version]
+
+        def check_for_update():
+            if not self._popup_open:
+                return
+            try:
+                if self._data_version != last_ver[0]:
+                    last_ver[0] = self._data_version
+                    do_flash()
+                popup.after(1000, check_for_update)
+            except tk.TclError:
+                pass  # Window was destroyed
+
+        # --- Initial build + start update loop ---
+        build_content()
+        popup.after(1000, check_for_update)
 
         popup.protocol("WM_DELETE_WINDOW", on_close)
         popup.mainloop()
@@ -484,8 +556,8 @@ class UsageMonitor:
         threading.Thread(target=self._refresh_usage, daemon=True).start()
 
     def _on_set_key(self, icon=None, item=None):
-        """Prompt user to enter a new session key (restarts tray icon)."""
-        threading.Thread(target=self._prompt_key_from_tray, daemon=True).start()
+        """Re-login via webview (restarts tray icon)."""
+        threading.Thread(target=self._relogin_from_tray, daemon=True).start()
 
     def _on_quit(self, icon=None, item=None):
         """Clean shutdown: stop threads, remove lock, exit tray."""
@@ -498,118 +570,57 @@ class UsageMonitor:
     # Authentication management
     # -----------------------------------------------------------------------
 
-    def _prompt_auth_sync(self) -> bool:
+    def _do_webview_login(self) -> bool:
         """
-        Show a custom dialog asking for sessionKey and cf_clearance.
+        Open an embedded browser window for the user to log into claude.ai.
 
-        Both cookies are found in the same browser panel:
-          F12 → Application → Cookies → https://claude.ai
-
-        cf_clearance is needed to bypass Cloudflare JS challenge on
-        machines where curl_cffi TLS impersonation doesn't work.
+        The real browser engine (Edge WebView2) handles Cloudflare automatically.
+        Once logged in, cookies are extracted and saved.
 
         Returns:
-            True if credentials were entered and saved, False if cancelled.
+            True if login succeeded, False if cancelled.
         """
-        result = {"ok": False}
+        log.info("Opening webview login window...")
+        cookies = login_and_get_cookies()
 
-        dialog = tk.Tk()
-        dialog.title("Claude Usage Monitor")
-        dialog.configure(bg="#1E1E1E")
-        dialog.attributes("-topmost", True)
-        dialog.resizable(False, False)
+        if not cookies:
+            log.info("Webview login cancelled or failed")
+            return False
 
-        # Center on screen
-        dw, dh = 480, 340
-        sx = (dialog.winfo_screenwidth() - dw) // 2
-        sy = (dialog.winfo_screenheight() - dh) // 2
-        dialog.geometry(f"{dw}x{dh}+{sx}+{sy}")
+        log.info(f"Webview login got cookies: {list(cookies.keys())}")
 
-        # Instructions
-        tk.Label(dialog, text="Enter cookies from claude.ai",
-                 font=("Segoe UI", 12, "bold"), fg="#FFFFFF", bg="#1E1E1E"
-                 ).pack(pady=(15, 5))
-        tk.Label(dialog,
-                 text="F12 → Application → Cookies → https://claude.ai",
-                 font=("Segoe UI", 9), fg="#888888", bg="#1E1E1E"
-                 ).pack(pady=(0, 10))
-
-        # sessionKey field
-        tk.Label(dialog, text="sessionKey (required):",
-                 font=("Segoe UI", 10), fg="#CCCCCC", bg="#1E1E1E", anchor="w"
-                 ).pack(fill="x", padx=30)
-        entry_sk = tk.Entry(dialog, font=("Consolas", 10), width=50,
-                            bg="#2A2A2A", fg="#FFFFFF", insertbackground="#FFFFFF",
-                            relief="flat", bd=4)
-        entry_sk.pack(padx=30, pady=(2, 10))
-
-        # cf_clearance field
-        tk.Label(dialog, text="cf_clearance (recommended — for Cloudflare bypass):",
-                 font=("Segoe UI", 10), fg="#CCCCCC", bg="#1E1E1E", anchor="w"
-                 ).pack(fill="x", padx=30)
-        entry_cf = tk.Entry(dialog, font=("Consolas", 10), width=50,
-                            bg="#2A2A2A", fg="#FFFFFF", insertbackground="#FFFFFF",
-                            relief="flat", bd=4)
-        entry_cf.pack(padx=30, pady=(2, 15))
-
-        # Buttons
-        btn_frame = tk.Frame(dialog, bg="#1E1E1E")
-        btn_frame.pack(pady=(5, 15))
-
-        def on_ok():
-            result["ok"] = True
-            result["session_key"] = entry_sk.get().strip()
-            result["cf_clearance"] = entry_cf.get().strip()
-            dialog.destroy()
-
-        def on_cancel():
-            dialog.destroy()
-
-        tk.Button(btn_frame, text="OK", command=on_ok, width=10,
-                  bg="#4CAF50", fg="#FFFFFF", font=("Segoe UI", 10, "bold"),
-                  relief="flat", bd=0, activebackground="#388E3C"
-                  ).pack(side="left", padx=5)
-        tk.Button(btn_frame, text="Cancel", command=on_cancel, width=10,
-                  bg="#555555", fg="#FFFFFF", font=("Segoe UI", 10),
-                  relief="flat", bd=0, activebackground="#777777"
-                  ).pack(side="left", padx=5)
-
-        entry_sk.focus_set()
-        dialog.bind("<Return>", lambda e: on_ok())
-        dialog.mainloop()
-
-        if result["ok"] and result.get("session_key"):
-            key = result["session_key"]
-            cf = result.get("cf_clearance", "")
-            log.info(f"Session key received (length={len(key)}), cf_clearance={'set' if cf else 'empty'}")
-
-            self.config["session_key"] = key
-            if cf:
-                self.config["cf_clearance"] = cf
-
-            # Build browser_cookies dict for the urllib backend
-            cookies = {"sessionKey": key}
-            if cf:
-                cookies["cf_clearance"] = cf
-            self._browser_cookies = cookies
-            self.api = ClaudeAPI(key, browser_cookies=cookies)
-
+        # Parse org data if the webview fetched it
+        orgs_data = cookies.pop("_orgs_data", None)
+        if orgs_data:
             try:
-                self._auto_select_org()
-                save_config(self.config)
-                log.info(f"Config saved. org_id={self.config.get('org_id')}")
+                orgs = json.loads(orgs_data)
+                if orgs:
+                    self.config["org_id"] = orgs[0].get("uuid", "")
+                    self.config["org_name"] = orgs[0].get("name", "Unknown")
+                    log.info(f"Org from webview: {self.config['org_name']}")
             except Exception as e:
-                log.error(f"Error after setting key: {e}", exc_info=True)
-                self.last_error = str(e)
-            return True
-        return False
+                log.warning(f"Failed to parse orgs data: {e}")
 
-    def _prompt_key_from_tray(self, icon=None, item=None):
-        """Re-prompt for session key while the app is running. Restarts the tray icon."""
+        # Save sessionKey and cookies
+        sk = cookies.get("sessionKey", "")
+        cf = cookies.get("cf_clearance", "")
+        if sk:
+            self.config["session_key"] = sk
+        if cf:
+            self.config["cf_clearance"] = cf
+
+        self._cookies = cookies
+        self.api = ClaudeAPI(cookies)
+        save_config(self.config)
+        return True
+
+    def _relogin_from_tray(self):
+        """Re-login via embedded browser. Restarts the tray icon."""
         if self.icon:
             self.icon.stop()
-        self._prompt_auth_sync()
-        self._refresh_usage()
+        if self._do_webview_login():
+            self._ensure_org()
+            self._refresh_usage()
         self._start_tray()
 
     def _auto_select_org(self):
@@ -651,7 +662,8 @@ class UsageMonitor:
             log.info("Refreshing usage data...")
             self.usage = self.api.fetch_all(self.config.get("org_id", ""))
             self.last_error = None
-            log.info(f"Usage refreshed: {self.usage}")
+            self._data_version += 1
+            log.info(f"Usage refreshed (v{self._data_version}): {self.usage}")
         except ClaudeAPIError as e:
             log.error(f"API error: {e}")
             self.last_error = str(e)
@@ -751,23 +763,9 @@ class UsageMonitor:
         # Step 0: Check for updates on GitHub
         check_for_update()
 
-        # Step 0.5: Try to extract cookies from browser (including cf_clearance)
-        log.info("Extracting cookies from browser...")
-        self._browser_cookies, cookie_err = extract_browser_cookies()
-        if self._browser_cookies and "sessionKey" in self._browser_cookies:
-            # Got cookies from browser — use them (no manual input needed!)
-            key = self._browser_cookies["sessionKey"]
-            self.config["session_key"] = key
-            self.api = ClaudeAPI(key, browser_cookies=self._browser_cookies)
-            self._auto_select_org()
-            save_config(self.config)
-            log.info(f"Auto-configured from browser cookies ({self._browser_cookies.get('_browser', '?')})")
-        else:
-            log.warning(f"Cookie extraction failed: {cookie_err}")
-
-        # Step 1: If no API client yet, prompt for manual session key
+        # Step 1: If no API client yet, open embedded browser for login
         if not self.api:
-            if not self._prompt_auth_sync():
+            if not self._do_webview_login():
                 log.info("No credentials provided, exiting.")
                 return
 
@@ -793,31 +791,6 @@ class UsageMonitor:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Special mode: extract cookies and exit (used by UAC elevation)
-    if len(sys.argv) >= 3 and sys.argv[1] == "--extract-cookies":
-        import json as _json
-        _result = {}
-        try:
-            import rookiepy
-            for _name, _fn in [("Edge", rookiepy.edge), ("Chrome", rookiepy.chrome), ("Firefox", rookiepy.firefox)]:
-                try:
-                    _raw = _fn(["claude.ai"])
-                    _cookies = {}
-                    for _c in _raw:
-                        if "claude.ai" in _c.get("domain", ""):
-                            _cookies[_c["name"]] = _c["value"]
-                    if _cookies and "sessionKey" in _cookies:
-                        _cookies["_browser"] = _name
-                        _result = _cookies
-                        break
-                except Exception:
-                    continue
-        except Exception as _e:
-            _result = {"error": str(_e)}
-        with open(sys.argv[2], "w", encoding="utf-8") as _f:
-            _json.dump(_result, _f)
-        sys.exit(0)
-
     if not check_single_instance():
         sys.exit(0)
     try:

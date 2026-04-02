@@ -1,4 +1,2 @@
-curl_cffi>=0.14.0
 pystray>=0.19.5
 Pillow>=10.0.0
-rookiepy>=0.5.0
