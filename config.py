@@ -28,9 +28,8 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 # ---------------------------------------------------------------------------
 
 DEFAULT_CONFIG = {
-    "auth_mode": "",     # "session_key" or "oauth_token"
-    "session_key": "",   # Encrypted with DPAPI before saving to disk
-    "oauth_token": "",   # Encrypted with DPAPI before saving to disk
+    "session_key": "",       # Encrypted with DPAPI before saving to disk
+    "cf_clearance": "",      # Cloudflare clearance cookie (encrypted)
     "org_id": "",        # Claude organization UUID
     "org_name": "",      # Claude organization display name
     "refresh_interval": 300,  # Auto-refresh interval in seconds (default 5min)
@@ -162,13 +161,13 @@ def load_config() -> dict:
         elif config.get("session_key", "").startswith("sk-ant-"):
             pass  # Keep plaintext key; it will be encrypted on next save
 
-        # Decrypt OAuth token if it's encrypted
-        encrypted_token = config.get("oauth_token_encrypted", "")
-        if encrypted_token:
+        # Decrypt cf_clearance if it's encrypted
+        encrypted_cf = config.get("cf_clearance_encrypted", "")
+        if encrypted_cf:
             try:
-                config["oauth_token"] = _dpapi_decrypt(encrypted_token)
+                config["cf_clearance"] = _dpapi_decrypt(encrypted_cf)
             except OSError:
-                config["oauth_token"] = ""
+                config["cf_clearance"] = ""
 
         return config
     except (json.JSONDecodeError, OSError):
@@ -191,7 +190,7 @@ def save_config(config: dict):
     to_save = dict(config)
 
     # Encrypt secrets before saving — plaintext NEVER written to disk
-    for field in ("session_key", "oauth_token"):
+    for field in ("session_key", "cf_clearance"):
         value = to_save.get(field, "")
         if value:
             to_save[f"{field}_encrypted"] = _dpapi_encrypt(value)

@@ -193,7 +193,12 @@ class UsageMonitor:
 
         self._browser_cookies = {}
         if self.config.get("session_key"):
-            self.api = ClaudeAPI(self.config["session_key"])
+            # Restore cookies from config (including cf_clearance if saved)
+            cookies = {"sessionKey": self.config["session_key"]}
+            if self.config.get("cf_clearance"):
+                cookies["cf_clearance"] = self.config["cf_clearance"]
+            self._browser_cookies = cookies
+            self.api = ClaudeAPI(self.config["session_key"], browser_cookies=cookies)
 
     # -----------------------------------------------------------------------
     # Tray icon rendering
@@ -495,29 +500,100 @@ class UsageMonitor:
 
     def _prompt_auth_sync(self) -> bool:
         """
-        Show a modal dialog asking the user to paste their sessionKey.
+        Show a custom dialog asking for sessionKey and cf_clearance.
+
+        Both cookies are found in the same browser panel:
+          F12 → Application → Cookies → https://claude.ai
+
+        cf_clearance is needed to bypass Cloudflare JS challenge on
+        machines where curl_cffi TLS impersonation doesn't work.
 
         Returns:
-            True if a key was entered and saved, False if cancelled.
+            True if credentials were entered and saved, False if cancelled.
         """
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        key = simpledialog.askstring(
-            "Claude Usage Monitor",
-            "Enter your sessionKey (from claude.ai cookies):\n\n"
-            "How to get it:\n"
-            "1. Open claude.ai in your browser\n"
-            "2. Press F12 -> Application -> Cookies\n"
-            "3. Copy the value of 'sessionKey'",
-            parent=root,
-        )
-        root.destroy()
-        if key and key.strip():
-            key = key.strip()
-            log.info(f"Session key received (length={len(key)})")
+        result = {"ok": False}
+
+        dialog = tk.Tk()
+        dialog.title("Claude Usage Monitor")
+        dialog.configure(bg="#1E1E1E")
+        dialog.attributes("-topmost", True)
+        dialog.resizable(False, False)
+
+        # Center on screen
+        dw, dh = 480, 340
+        sx = (dialog.winfo_screenwidth() - dw) // 2
+        sy = (dialog.winfo_screenheight() - dh) // 2
+        dialog.geometry(f"{dw}x{dh}+{sx}+{sy}")
+
+        # Instructions
+        tk.Label(dialog, text="Enter cookies from claude.ai",
+                 font=("Segoe UI", 12, "bold"), fg="#FFFFFF", bg="#1E1E1E"
+                 ).pack(pady=(15, 5))
+        tk.Label(dialog,
+                 text="F12 → Application → Cookies → https://claude.ai",
+                 font=("Segoe UI", 9), fg="#888888", bg="#1E1E1E"
+                 ).pack(pady=(0, 10))
+
+        # sessionKey field
+        tk.Label(dialog, text="sessionKey (required):",
+                 font=("Segoe UI", 10), fg="#CCCCCC", bg="#1E1E1E", anchor="w"
+                 ).pack(fill="x", padx=30)
+        entry_sk = tk.Entry(dialog, font=("Consolas", 10), width=50,
+                            bg="#2A2A2A", fg="#FFFFFF", insertbackground="#FFFFFF",
+                            relief="flat", bd=4)
+        entry_sk.pack(padx=30, pady=(2, 10))
+
+        # cf_clearance field
+        tk.Label(dialog, text="cf_clearance (recommended — for Cloudflare bypass):",
+                 font=("Segoe UI", 10), fg="#CCCCCC", bg="#1E1E1E", anchor="w"
+                 ).pack(fill="x", padx=30)
+        entry_cf = tk.Entry(dialog, font=("Consolas", 10), width=50,
+                            bg="#2A2A2A", fg="#FFFFFF", insertbackground="#FFFFFF",
+                            relief="flat", bd=4)
+        entry_cf.pack(padx=30, pady=(2, 15))
+
+        # Buttons
+        btn_frame = tk.Frame(dialog, bg="#1E1E1E")
+        btn_frame.pack(pady=(5, 15))
+
+        def on_ok():
+            result["ok"] = True
+            result["session_key"] = entry_sk.get().strip()
+            result["cf_clearance"] = entry_cf.get().strip()
+            dialog.destroy()
+
+        def on_cancel():
+            dialog.destroy()
+
+        tk.Button(btn_frame, text="OK", command=on_ok, width=10,
+                  bg="#4CAF50", fg="#FFFFFF", font=("Segoe UI", 10, "bold"),
+                  relief="flat", bd=0, activebackground="#388E3C"
+                  ).pack(side="left", padx=5)
+        tk.Button(btn_frame, text="Cancel", command=on_cancel, width=10,
+                  bg="#555555", fg="#FFFFFF", font=("Segoe UI", 10),
+                  relief="flat", bd=0, activebackground="#777777"
+                  ).pack(side="left", padx=5)
+
+        entry_sk.focus_set()
+        dialog.bind("<Return>", lambda e: on_ok())
+        dialog.mainloop()
+
+        if result["ok"] and result.get("session_key"):
+            key = result["session_key"]
+            cf = result.get("cf_clearance", "")
+            log.info(f"Session key received (length={len(key)}), cf_clearance={'set' if cf else 'empty'}")
+
             self.config["session_key"] = key
-            self.api = ClaudeAPI(key)
+            if cf:
+                self.config["cf_clearance"] = cf
+
+            # Build browser_cookies dict for the urllib backend
+            cookies = {"sessionKey": key}
+            if cf:
+                cookies["cf_clearance"] = cf
+            self._browser_cookies = cookies
+            self.api = ClaudeAPI(key, browser_cookies=cookies)
+
             try:
                 self._auto_select_org()
                 save_config(self.config)
