@@ -43,7 +43,7 @@ import webbrowser
 # ---------------------------------------------------------------------------
 
 APP_VERSION = "0.2"
-GITHUB_REPO = "RedGranite/claude-usage-monitor"
+GITHUB_REPO = "RedGranite/claude-usage-monitor-win"
 
 # ---------------------------------------------------------------------------
 # Logging — writes to %APPDATA%/ClaudeUsageMonitor/debug.log
