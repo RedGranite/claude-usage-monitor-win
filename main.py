@@ -24,6 +24,7 @@ from tkinter import messagebox
 from datetime import datetime, timezone
 import sys
 import ctypes
+import ctypes.wintypes
 
 from PIL import Image, ImageDraw, ImageFont
 import pystray
@@ -37,6 +38,7 @@ import os
 import json
 import urllib.request
 import webbrowser
+import winreg
 
 # ---------------------------------------------------------------------------
 # Version info — update this when releasing a new version
@@ -165,6 +167,118 @@ def cleanup_lock():
 
 
 # ---------------------------------------------------------------------------
+# Auto-start (Windows registry)
+# ---------------------------------------------------------------------------
+
+_AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_AUTOSTART_NAME = "ClaudeUsageMonitor"
+
+
+def _get_exe_path() -> str:
+    """Return the path of the running executable (or script)."""
+    if getattr(sys, "frozen", False):
+        return sys.executable                        # PyInstaller exe
+    return os.path.abspath(sys.argv[0])              # python script
+
+
+def is_autostart_enabled() -> bool:
+    """Check if auto-start registry entry exists and points to current exe."""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_KEY) as key:
+            val, _ = winreg.QueryValueEx(key, _AUTOSTART_NAME)
+            return os.path.normcase(val.strip('"')) == os.path.normcase(_get_exe_path())
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+
+def set_autostart(enable: bool):
+    """Add or remove the auto-start registry entry."""
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, _AUTOSTART_KEY, 0, winreg.KEY_SET_VALUE
+        ) as key:
+            if enable:
+                winreg.SetValueEx(key, _AUTOSTART_NAME, 0, winreg.REG_SZ,
+                                  f'"{_get_exe_path()}"')
+                log.info(f"Auto-start enabled: {_get_exe_path()}")
+            else:
+                try:
+                    winreg.DeleteValue(key, _AUTOSTART_NAME)
+                    log.info("Auto-start disabled")
+                except FileNotFoundError:
+                    pass
+    except OSError as e:
+        log.error(f"Failed to set auto-start: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Classic balloon tip (Win32 Shell_NotifyIconW, forces legacy style)
+# ---------------------------------------------------------------------------
+
+class _NOTIFYICONDATAW(ctypes.Structure):
+    """Win32 NOTIFYICONDATAW — passed to Shell_NotifyIconW."""
+    _fields_ = [
+        ("cbSize",           ctypes.wintypes.DWORD),
+        ("hWnd",             ctypes.wintypes.HWND),
+        ("uID",              ctypes.wintypes.UINT),
+        ("uFlags",           ctypes.wintypes.UINT),
+        ("uCallbackMessage", ctypes.wintypes.UINT),
+        ("hIcon",            ctypes.wintypes.HICON),
+        ("szTip",            ctypes.c_wchar * 128),
+        ("dwState",          ctypes.wintypes.DWORD),
+        ("dwStateMask",      ctypes.wintypes.DWORD),
+        ("szInfo",           ctypes.c_wchar * 256),
+        ("uVersion",         ctypes.wintypes.UINT),   # union with uTimeout
+        ("szInfoTitle",      ctypes.c_wchar * 64),
+        ("dwInfoFlags",      ctypes.wintypes.DWORD),
+        ("guidItem",         ctypes.c_byte * 16),
+        ("hBalloonIcon",     ctypes.wintypes.HICON),
+    ]
+
+_NIM_MODIFY     = 0x00000001
+_NIM_SETVERSION = 0x00000004
+_NIF_INFO       = 0x00000010
+_NIIF_INFO      = 0x00000001
+_NIIF_NONE      = 0x00000000
+_NOTIFYICON_VERSION = 3          # version 3 = classic balloon (not toast)
+
+_Shell_NotifyIconW = ctypes.windll.shell32.Shell_NotifyIconW
+
+
+def _show_classic_balloon(icon: pystray.Icon, title: str, message: str):
+    """
+    Show a classic Windows balloon tip on the tray icon.
+
+    Forces NOTIFYICON_VERSION=3 so the balloon renders in legacy style
+    (small bubble next to tray icon) instead of Win10 toast notification.
+    """
+    try:
+        hwnd = icon._hwnd
+    except AttributeError:
+        # Fallback: pystray's own notify (may show as toast)
+        icon.notify(message, title)
+        return
+
+    nid = _NOTIFYICONDATAW()
+    nid.cbSize = ctypes.sizeof(_NOTIFYICONDATAW)
+    nid.hWnd = hwnd
+    nid.uID = 0
+
+    # Force legacy balloon version
+    nid.uVersion = _NOTIFYICON_VERSION
+    _Shell_NotifyIconW(_NIM_SETVERSION, ctypes.byref(nid))
+
+    # Show the balloon
+    nid.uFlags = _NIF_INFO
+    nid.szInfoTitle = title[:63]
+    nid.szInfo = message[:255]
+    nid.dwInfoFlags = _NIIF_INFO
+    _Shell_NotifyIconW(_NIM_MODIFY, ctypes.byref(nid))
+
+
+# ---------------------------------------------------------------------------
 # Main application class
 # ---------------------------------------------------------------------------
 
@@ -190,8 +304,12 @@ class UsageMonitor:
         self.running = True                      # Controls background thread lifecycle
         self._strip_on = True                    # Blink state for tray icon light strip
         self._popup_open = False                 # Prevents multiple dashboard windows
+        self._popup_window: Optional[tk.Tk] = None  # Reference to dashboard window
         self._popup_pinned = False               # Dashboard "always on top" state
         self._data_version = 0                   # Incremented on each successful refresh
+        self._notified_brackets: dict[str, int] = {}  # Last notified 10% bracket per period
+        self._click_time = 0.0                   # Timestamp of last left-click
+        self._click_timer: Optional[threading.Timer] = None  # Single-click delay timer
 
         self._cookies = {}  # Browser cookies for API requests
         if self.config.get("session_key"):
@@ -308,22 +426,80 @@ class UsageMonitor:
 
     def _build_menu(self) -> pystray.Menu:
         """Build the right-click context menu for the tray icon."""
-        items = []
-        # default=True makes this action trigger on left-click
-        items.append(pystray.MenuItem("Show Dashboard", self._on_show_popup, default=True))
-        items.append(pystray.Menu.SEPARATOR)
-        items.append(pystray.MenuItem("Refresh Now", self._on_refresh))
-        items.append(pystray.MenuItem("Re-login...", self._on_set_key))
-        items.append(pystray.Menu.SEPARATOR)
-        items.append(pystray.MenuItem(f"v{APP_VERSION}", None, enabled=False))
-        items.append(pystray.MenuItem("Quit", self._on_quit))
-        return pystray.Menu(*items)
+        return pystray.Menu(
+            # default=True → fires on left-click, we route via _on_tray_click
+            pystray.MenuItem("Show Dashboard", self._on_tray_click, default=True),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Refresh Now", self._on_refresh),
+            pystray.MenuItem(
+                "Auto-start",
+                self._on_toggle_autostart,
+                checked=lambda item: is_autostart_enabled(),
+            ),
+            pystray.MenuItem("Re-login...", self._on_set_key),
+            pystray.MenuItem("Test Animations", self._on_test),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(f"v{APP_VERSION}", None, enabled=False),
+            pystray.MenuItem("Quit", self._on_quit),
+        )
 
-    def _on_show_popup(self, icon=None, item=None):
-        """Handle left-click / "Show Dashboard" — open popup if not already open."""
-        if self._popup_open:
+    # -----------------------------------------------------------------------
+    # Single-click / double-click dispatch
+    # -----------------------------------------------------------------------
+
+    def _on_tray_click(self, icon=None, item=None):
+        """
+        Dispatch left-click: single-click → balloon, double-click → dashboard.
+
+        Uses a 400 ms timer to distinguish the two.
+        """
+        now = time.time()
+        if self._click_timer:
+            self._click_timer.cancel()
+            self._click_timer = None
+
+        if now - self._click_time < 0.4:
+            # Double-click detected
+            self._click_time = 0.0
+            self._open_or_focus_dashboard()
+        else:
+            # First click — wait 400 ms to see if a second follows
+            self._click_time = now
+            self._click_timer = threading.Timer(0.4, self._show_usage_balloon)
+            self._click_timer.start()
+
+    def _show_usage_balloon(self):
+        """Single-click action: show a classic balloon tip with usage summary."""
+        if not self.icon:
             return
-        threading.Thread(target=self._show_usage_popup, daemon=True).start()
+        if not self.usage:
+            _show_classic_balloon(self.icon, "Claude Usage", "No data yet")
+            return
+
+        lines = []
+        for key in ("five_hour", "seven_day"):
+            data = self.usage.get(key)
+            if data:
+                lines.append(f"{data['label']}: {data['percentage']:.0f}%")
+        _show_classic_balloon(self.icon, "Claude Usage", "\n".join(lines) or "No data")
+
+    def _open_or_focus_dashboard(self):
+        """Double-click action: open dashboard, or focus it if already open."""
+        if self._popup_open and self._popup_window:
+            try:
+                self._popup_window.attributes("-topmost", True)
+                self._popup_window.lift()
+                self._popup_window.focus_force()
+                # Restore original topmost state
+                if not self._popup_pinned:
+                    self._popup_window.after(200, lambda:
+                        self._popup_window.attributes("-topmost", False)
+                        if self._popup_window else None)
+                return
+            except tk.TclError:
+                pass  # Window was destroyed
+        if not self._popup_open:
+            threading.Thread(target=self._show_usage_popup, daemon=True).start()
 
     def _show_usage_popup(self):
         """
@@ -346,6 +522,7 @@ class UsageMonitor:
         FLASH_BG = "#1A2E1A"  # Subtle green tint for refresh flash
 
         popup = tk.Tk()
+        self._popup_window = popup
         popup.title("Claude Usage")
         popup.configure(bg=BG)
         popup.overrideredirect(True)  # Remove native title bar
@@ -364,6 +541,7 @@ class UsageMonitor:
 
         def on_close():
             self._popup_open = False
+            self._popup_window = None
             popup.destroy()
 
         # Close button (red ✕)
@@ -493,20 +671,19 @@ class UsageMonitor:
         _flash = {"active": False}
 
         def do_flash():
-            """Play a 3-step flash animation when data refreshes.
+            """Play a flash animation when data refreshes.
 
-            Step 1: Green-tinted background + bright green top accent line
-            Step 2: Accent line brightens
-            Step 3: Restore normal dark background
+            Uses place() for the accent line so it overlays without
+            pushing content down. Background tints green then restores.
             """
             if _flash["active"]:
                 return
             _flash["active"] = True
 
-            # Step 1: rebuild with green-tinted background + accent line
+            # Step 1: green-tinted background + overlay accent line
             build_content(bg_color=FLASH_BG)
             accent = tk.Frame(content, bg="#4CAF50", height=2)
-            accent.pack(side="top", fill="x", before=content.winfo_children()[0])
+            accent.place(x=0, y=0, relwidth=1.0)
 
             def step2():
                 try:
@@ -555,9 +732,60 @@ class UsageMonitor:
         """Trigger an immediate usage data refresh."""
         threading.Thread(target=self._refresh_usage, daemon=True).start()
 
+    def _on_toggle_autostart(self, icon=None, item=None):
+        """Toggle auto-start on/off in the Windows registry."""
+        set_autostart(not is_autostart_enabled())
+
     def _on_set_key(self, icon=None, item=None):
         """Re-login via webview (restarts tray icon)."""
         threading.Thread(target=self._relogin_from_tray, daemon=True).start()
+
+    def _on_test(self, icon=None, item=None):
+        """Run a visual test: simulate usage climbing 0% → 100% with notifications."""
+        threading.Thread(target=self._run_test_sequence, daemon=True).start()
+
+    def _run_test_sequence(self):
+        """
+        Simulate usage data going from 0% to 100% in 10% steps.
+
+        At each step: update data → trigger icon + dashboard refresh → fire
+        threshold notification. Pauses 2 s between steps so the user can see
+        each animation and bubble.
+        """
+        log.info("=== TEST SEQUENCE START ===")
+        saved_usage = self.usage
+        saved_brackets = self._notified_brackets.copy()
+        self._notified_brackets = {}
+
+        from datetime import timedelta
+        now = datetime.now(timezone.utc)
+
+        for pct in range(0, 101, 10):
+            self.usage = {
+                "five_hour": {
+                    "label": "5h Session",
+                    "percentage": float(pct),
+                    "reset_time": now + timedelta(hours=4, minutes=30),
+                },
+                "seven_day": {
+                    "label": "7d Weekly",
+                    "percentage": float(min(pct // 2, 100)),
+                    "reset_time": now + timedelta(days=5),
+                },
+            }
+            self._data_version += 1
+            self._update_icon()
+            self._check_thresholds()
+            log.info(f"TEST step: 5h={pct}%")
+            time.sleep(2)
+
+        # Restore real data
+        time.sleep(1)
+        self.usage = saved_usage
+        self._notified_brackets = saved_brackets
+        self._data_version += 1
+        self._update_icon()
+        log.info("=== TEST SEQUENCE END ===")
 
     def _on_quit(self, icon=None, item=None):
         """Clean shutdown: stop threads, remove lock, exit tray."""
@@ -621,7 +849,18 @@ class UsageMonitor:
         if self._do_webview_login():
             self._ensure_org()
             self._refresh_usage()
-        self._start_tray()
+        # Re-create tray icon in a background thread
+        self.icon = pystray.Icon(
+            "claude_usage",
+            self._create_icon(self._get_status_color(),
+                              str(int(self.usage["five_hour"]["percentage"]))
+                              if self.usage and "five_hour" in self.usage else "",
+                              self._strip_on),
+            "Claude Usage Monitor",
+            menu=self._build_menu(),
+        )
+        self._update_icon()
+        threading.Thread(target=self.icon.run, daemon=True).start()
 
     def _auto_select_org(self):
         """Fetch organizations and automatically select the first one."""
@@ -671,6 +910,7 @@ class UsageMonitor:
             log.error(f"Unexpected error: {e}", exc_info=True)
             self.last_error = f"Unexpected: {e}"
         self._update_icon()
+        self._check_thresholds()
 
     def _update_icon(self):
         """Redraw the tray icon and tooltip with current usage data."""
@@ -688,6 +928,43 @@ class UsageMonitor:
                 self.icon.title = "Claude Usage Monitor"
             self.icon.icon = self._create_icon(color, pct_text, self._strip_on)
             self.icon.menu = self._build_menu()
+
+    def _check_thresholds(self):
+        """
+        Check if any usage crossed a 10% boundary and send a tray notification.
+
+        Tracks per-period brackets so each boundary only fires once.
+        A decrease (e.g. after reset) silently updates the tracker.
+        """
+        if not self.usage or not self.icon:
+            return
+        for key in ("five_hour", "seven_day"):
+            data = self.usage.get(key)
+            if not data:
+                continue
+            pct = data["percentage"]
+            bracket = int(pct // 10) * 10          # 0, 10, 20, …, 100
+            last = self._notified_brackets.get(key, -1)
+
+            if last == -1:
+                # First data — just record, don't notify
+                self._notified_brackets[key] = bracket
+            elif bracket > last:
+                # Crossed upward — notify
+                self._notified_brackets[key] = bracket
+                label = data["label"]
+                try:
+                    _show_classic_balloon(
+                        self.icon,
+                        "Claude Usage Monitor",
+                        f"{label} reached {pct:.0f}%",
+                    )
+                    log.info(f"Threshold notify: {label} → {pct:.0f}% (bracket {bracket})")
+                except Exception as e:
+                    log.debug(f"Notify failed: {e}")
+            elif bracket < last:
+                # Decreased (reset) — update silently
+                self._notified_brackets[key] = bracket
 
     # -----------------------------------------------------------------------
     # Background threads
@@ -778,26 +1055,48 @@ class UsageMonitor:
             if self.config.get("org_id"):
                 save_config(self.config)
 
+    def _show_splash_tray(self):
+        """
+        Show a temporary gray tray icon immediately on startup so the user
+        knows the app is loading.  Replaced by the real icon once data is ready.
+        """
+        self.icon = pystray.Icon(
+            "claude_usage",
+            self._create_icon("gray", "...", strip_on=False),
+            "Claude Usage Monitor — loading...",
+            menu=self._build_menu(),
+        )
+        # Run tray in a background thread so we can continue initialising
+        threading.Thread(target=self.icon.run, daemon=True).start()
+        # Give the tray icon a moment to appear
+        time.sleep(0.3)
+
     def run(self):
         """
         Main entry point. Sequence:
+          0. Show a loading tray icon instantly
           1. Prompt for session key if not configured
           2. Ensure organization is selected
           3. Perform initial usage data fetch
           4. Start background refresh + blink threads
-          5. Run tray icon (blocks until quit)
+          5. Swap to the real tray icon (blocks until quit)
         """
         log.info(f"=== Claude Usage Monitor v{APP_VERSION} starting ===")
         log.info(f"Config: session_key={'set' if self.config.get('session_key') else 'empty'}, org_id={self.config.get('org_id')}")
         log.info(f"Log file: {LOG_FILE}")
 
-        # Step 0: Check for updates on GitHub
+        # Step 0: Show loading tray icon right away
+        self._show_splash_tray()
+
+        # Step 0.5: Check for updates on GitHub
         check_for_update()
 
         # Step 1: If no API client yet, open embedded browser for login
         if not self.api:
             if not self._do_webview_login():
                 log.info("No credentials provided, exiting.")
+                if self.icon:
+                    self.icon.stop()
                 return
 
         # Step 2: Ensure we have an organization selected
@@ -813,8 +1112,14 @@ class UsageMonitor:
         threading.Thread(target=self._refresh_loop, daemon=True).start()
         threading.Thread(target=self._blink_loop, daemon=True).start()
 
-        # Step 5: Run tray icon (blocks main thread until quit)
-        self._start_tray()
+        # Step 5: The splash tray is already running — just update it with
+        #         real data and let the main thread wait for it to stop.
+        log.info("Startup complete, tray icon ready.")
+        self._update_icon()
+
+        # Block the main thread until icon.stop() is called (by Quit)
+        while self.running:
+            time.sleep(1)
 
 
 # ---------------------------------------------------------------------------
