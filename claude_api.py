@@ -42,7 +42,7 @@ class ClaudeAPIError(Exception):
 # Browser cookie extraction (requires admin on Chrome/Edge v130+)
 # ---------------------------------------------------------------------------
 
-def extract_browser_cookies() -> dict:
+def extract_browser_cookies() -> tuple[dict, str]:
     """
     Extract claude.ai cookies from the user's browser.
 
@@ -50,37 +50,39 @@ def extract_browser_cookies() -> dict:
     launches a UAC-elevated helper to read cookies.
 
     Returns:
-        Dict of cookie_name -> cookie_value, or empty dict on failure.
+        (cookies_dict, error_message) — cookies may be empty on failure.
     """
     # Step 1: Try directly (works on older browsers or Firefox)
-    cookies = _try_rookiepy_direct()
+    cookies, errors = _try_rookiepy_direct()
     if cookies and "sessionKey" in cookies:
         log.info(f"Cookies extracted directly from {cookies.get('_browser', 'browser')}")
-        return cookies
+        return cookies, ""
 
     # Step 2: Try with admin elevation via UAC
-    log.info("Direct extraction failed, trying UAC elevation...")
+    log.info(f"Direct extraction failed ({errors}), trying UAC elevation...")
     cookies = _try_rookiepy_elevated()
     if cookies and "sessionKey" in cookies:
         log.info(f"Cookies extracted with admin from {cookies.get('_browser', 'browser')}")
-        return cookies
+        return cookies, ""
 
-    return {}
+    return {}, errors
 
 
-def _try_rookiepy_direct() -> dict:
+def _try_rookiepy_direct() -> tuple[dict, str]:
     """Try to extract cookies without admin. May fail on Chrome/Edge v130+."""
     try:
         import rookiepy
-    except ImportError:
-        log.warning("rookiepy not installed")
-        return {}
+    except ImportError as e:
+        msg = f"rookiepy import failed: {e}"
+        log.warning(msg)
+        return {}, msg
 
     browsers = [
         ("Edge", rookiepy.edge),
         ("Chrome", rookiepy.chrome),
         ("Firefox", rookiepy.firefox),
     ]
+    errors = []
     for name, fn in browsers:
         try:
             raw = fn(["claude.ai"])
@@ -90,10 +92,14 @@ def _try_rookiepy_direct() -> dict:
                     cookies[c["name"]] = c["value"]
             if cookies and "sessionKey" in cookies:
                 cookies["_browser"] = name
-                return cookies
+                return cookies, ""
+            elif cookies:
+                errors.append(f"{name}: found cookies but no sessionKey ({list(cookies.keys())})")
+            else:
+                errors.append(f"{name}: no claude.ai cookies found")
         except Exception as e:
-            log.debug(f"{name}: {e}")
-    return {}
+            errors.append(f"{name}: {e}")
+    return {}, "; ".join(errors)
 
 
 def _try_rookiepy_elevated() -> dict:

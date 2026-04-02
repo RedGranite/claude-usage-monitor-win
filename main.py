@@ -677,7 +677,7 @@ class UsageMonitor:
 
         # Step 0.5: Try to extract cookies from browser (including cf_clearance)
         log.info("Extracting cookies from browser...")
-        self._browser_cookies = extract_browser_cookies()
+        self._browser_cookies, cookie_err = extract_browser_cookies()
         if self._browser_cookies and "sessionKey" in self._browser_cookies:
             # Got cookies from browser — use them (no manual input needed!)
             key = self._browser_cookies["sessionKey"]
@@ -686,8 +686,8 @@ class UsageMonitor:
             self._auto_select_org()
             save_config(self.config)
             log.info(f"Auto-configured from browser cookies ({self._browser_cookies.get('_browser', '?')})")
-        elif self._browser_cookies:
-            log.info(f"Browser cookies found but no sessionKey: {list(self._browser_cookies.keys())}")
+        else:
+            log.warning(f"Cookie extraction failed: {cookie_err}")
 
         # Step 1: If no API client yet, prompt for manual session key
         if not self.api:
