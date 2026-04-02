@@ -708,12 +708,43 @@ class UsageMonitor:
                 except Exception:
                     pass
 
+    def _next_sleep(self) -> float:
+        """
+        Calculate how long to sleep before the next refresh.
+
+        Normally uses the configured interval (default 5 min), but if a
+        reset time is approaching sooner, wake up ~10 s after it so the
+        dashboard updates promptly.
+        """
+        interval = self.config.get("refresh_interval", 300)
+        if not self.usage:
+            return interval
+
+        now = datetime.now(timezone.utc)
+        for key in ("five_hour", "seven_day"):
+            reset = (self.usage.get(key) or {}).get("reset_time")
+            if reset:
+                secs = (reset - now).total_seconds()
+                if secs <= 0:
+                    # Already past reset — refresh soon
+                    return 5
+                if secs + 10 < interval:
+                    # Reset coming before next scheduled refresh
+                    interval = secs + 10
+        return max(5, interval)
+
     def _refresh_loop(self):
-        """Periodically refresh usage data (default: every 5 minutes)."""
+        """Periodically refresh usage data, waking early when a reset is due."""
         while self.running:
             if self.api and self.config.get("org_id"):
                 self._refresh_usage()
-            time.sleep(self.config.get("refresh_interval", 300))
+            sleep_secs = self._next_sleep()
+            log.debug(f"Next refresh in {sleep_secs:.0f}s")
+            # Sleep in small increments so we can stop quickly on quit
+            elapsed = 0.0
+            while elapsed < sleep_secs and self.running:
+                time.sleep(min(5, sleep_secs - elapsed))
+                elapsed += 5
 
     # -----------------------------------------------------------------------
     # Application lifecycle
