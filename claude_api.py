@@ -46,7 +46,14 @@ class ClaudeAPI:
 
         # curl_cffi impersonates Chrome's TLS fingerprint to bypass Cloudflare.
         # Standard Python `requests` gets blocked with a 403 challenge page.
-        self.session = requests.Session(impersonate="chrome")
+        # Try the latest Chrome fingerprint, fall back to generic "chrome"
+        # if the specific version isn't available in the installed curl_cffi.
+        for fp in ("chrome130", "chrome124", "chrome120", "chrome"):
+            try:
+                self.session = requests.Session(impersonate=fp)
+                break
+            except Exception:
+                continue
         self.session.headers.update({
             "Accept": "application/json",
             "Content-Type": "application/json",
@@ -66,6 +73,15 @@ class ClaudeAPI:
             raise ClaudeAPIError(f"{action}: HTTP {resp.status_code} - {msg or resp.text[:100]}")
         if resp.status_code != 200:
             raise ClaudeAPIError(f"{action}: HTTP {resp.status_code}")
+
+        # Cloudflare may return 200 with an HTML challenge page instead of JSON.
+        # Detect this by checking Content-Type header.
+        ct = resp.headers.get("content-type", "")
+        if "application/json" not in ct:
+            raise ClaudeAPIError(
+                f"{action}: Cloudflare blocked the request (got HTML instead of JSON). "
+                "Try updating curl_cffi: pip install -U curl_cffi"
+            )
 
     def get_organizations(self) -> list[dict]:
         """
