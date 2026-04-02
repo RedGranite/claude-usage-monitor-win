@@ -28,7 +28,7 @@ import ctypes
 from PIL import Image, ImageDraw, ImageFont
 import pystray
 
-from claude_api import ClaudeAPI, ClaudeAPIError
+from claude_api import ClaudeAPI, ClaudeAPIError, extract_browser_cookies
 from config import load_config, save_config, CONFIG_DIR
 
 from typing import Optional
@@ -191,6 +191,7 @@ class UsageMonitor:
         self._popup_open = False                 # Prevents multiple dashboard windows
         self._popup_pinned = False               # Dashboard "always on top" state
 
+        self._browser_cookies = {}
         if self.config.get("session_key"):
             self.api = ClaudeAPI(self.config["session_key"])
 
@@ -668,14 +669,27 @@ class UsageMonitor:
           5. Run tray icon (blocks until quit)
         """
         log.info(f"=== Claude Usage Monitor v{APP_VERSION} starting ===")
-        auth_mode = self.config.get("auth_mode", "none")
-        log.info(f"Config: auth_mode={auth_mode}, org_id={self.config.get('org_id')}")
+        log.info(f"Config: session_key={'set' if self.config.get('session_key') else 'empty'}, org_id={self.config.get('org_id')}")
         log.info(f"Log file: {LOG_FILE}")
 
         # Step 0: Check for updates on GitHub
         check_for_update()
 
-        # Step 1: Ensure we have credentials
+        # Step 0.5: Try to extract cookies from browser (including cf_clearance)
+        log.info("Extracting cookies from browser...")
+        self._browser_cookies = extract_browser_cookies()
+        if self._browser_cookies and "sessionKey" in self._browser_cookies:
+            # Got cookies from browser — use them (no manual input needed!)
+            key = self._browser_cookies["sessionKey"]
+            self.config["session_key"] = key
+            self.api = ClaudeAPI(key, browser_cookies=self._browser_cookies)
+            self._auto_select_org()
+            save_config(self.config)
+            log.info(f"Auto-configured from browser cookies ({self._browser_cookies.get('_browser', '?')})")
+        elif self._browser_cookies:
+            log.info(f"Browser cookies found but no sessionKey: {list(self._browser_cookies.keys())}")
+
+        # Step 1: If no API client yet, prompt for manual session key
         if not self.api:
             if not self._prompt_auth_sync():
                 log.info("No credentials provided, exiting.")
@@ -703,6 +717,15 @@ class UsageMonitor:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # Special mode: extract cookies and exit (used by UAC elevation)
+    if len(sys.argv) >= 3 and sys.argv[1] == "--extract-cookies":
+        from cookie_helper import extract_cookies
+        import json as _json
+        result = extract_cookies()
+        with open(sys.argv[2], "w", encoding="utf-8") as _f:
+            _json.dump(result, _f)
+        sys.exit(0)
+
     if not check_single_instance():
         sys.exit(0)
     try:
